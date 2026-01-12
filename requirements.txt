@@ -1,0 +1,8 @@
+numpy==1.23.0
+pyulog==1.0.0
+tornado==4.5.3
+setuptools==79.0.1
+opencv-contrib-python==4.6.0.66
+opencv-python==4.6.0.66
+msgpack-rpc-python==0.4.1
+airsim==1.8.1
