@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -14,13 +16,6 @@ import termios
 import tty
 import select
 
-# Optional dependencies for video display
-try:
-    import cv2  # type: ignore
-    import numpy as np  # type: ignore
-except Exception:  # pragma: no cover
-    cv2 = None  # type: ignore
-    np = None  # type: ignore
 
 
 class AirSimOffboardControl(Node):
