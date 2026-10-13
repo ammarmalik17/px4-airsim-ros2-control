@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 
+import math
+import queue
+import select
+import sys
+import termios
+import threading
+import time
+import tty
+
+import airsim
 import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus
-import airsim
-import threading
-import queue
-import time
-import math
-import sys
-import termios
-import tty
-import select
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
+from px4_msgs.msg import (
+    OffboardControlMode,
+    TrajectorySetpoint,
+    VehicleCommand,
+    VehicleLocalPosition,
+    VehicleStatus,
+)
 
 
 class AirSimOffboardControl(Node):
@@ -44,7 +51,7 @@ class AirSimOffboardControl(Node):
         self.vehicle_local_position_subscriber = self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
         self.vehicle_status_subscriber = self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile)
+            VehicleStatus, '/fmu/out/vehicle_status_v1', self.vehicle_status_callback, qos_profile)
 
         # Initialize variables
         self.vehicle_local_position = VehicleLocalPosition()
@@ -95,7 +102,7 @@ class AirSimOffboardControl(Node):
         print('  V: Toggle AirSim Video Feed')
         print('  X: Stop (zero velocity)')
         print('  ESC: Exit')
-        print('')
+        print()
         print('IMPORTANT: Wait for 10 setpoints to be sent before pressing "O"')
         print('Note: Make sure this terminal has focus for keyboard input!')
         print('Velocity decays automatically when keys are released.')
@@ -132,24 +139,37 @@ class AirSimOffboardControl(Node):
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
 
     def engage_offboard_mode(self):
-        """Switch to offboard mode."""
+        """Switch to offboard mode and verify that PX4 actually accepted it."""
         if self.offboard_setpoint_counter < 10:
             print(f"⚠ Need to send more setpoints before offboard mode ({self.offboard_setpoint_counter}/10)")
             return
-            
+
         print("🚁 Engaging offboard mode...")
-        
+
+        # Arm only if not already armed (avoids resetting an existing auto mode)
+        if self.vehicle_status.arming_state != VehicleStatus.ARMING_STATE_ARMED:
+            self.publish_vehicle_command(
+                VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
+            time.sleep(0.1)
+
         # Send the mode change command (PX4 command to switch to offboard)
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
-        time.sleep(0.2)
-        
-        # Send arm command
-        self.publish_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
-        
-        self.offboard_mode_enabled = True
-        print("✓ Offboard mode engaged - Ready to fly!")
+
+        # Poll vehicle_status_v1 for up to 2 s to confirm commander accepted OFFBOARD
+        for _ in range(40):
+            time.sleep(0.05)
+            if self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
+                self.offboard_mode_enabled = True
+                print("✓ Offboard mode engaged (verified via nav_state=14)")
+                return
+
+        self.offboard_mode_enabled = False
+        print(f"✗ Offboard NOT engaged. nav_state={self.vehicle_status.nav_state} "
+              f"(expected {VehicleStatus.NAVIGATION_STATE_OFFBOARD}), "
+              f"arming_state={self.vehicle_status.arming_state}")
+        print("  Likely cause: OffboardControlMode freshness check failing (AirSim time jumps).")
+        print("  In pxh>, run: `param set COM_OF_LOSS_T 5.0` and retry pressing 'O'.")
 
     def disable_offboard_mode(self):
         """Disable offboard mode."""
@@ -514,7 +534,9 @@ def main(args=None) -> None:
             offboard_control.shutdown()
             
         try:
-            rclpy.spin(offboard_control)
+            # Poll spin_once so we exit cleanly when the keyboard thread sets running=False
+            while rclpy.ok() and offboard_control.running:
+                rclpy.spin_once(offboard_control, timeout_sec=0.1)
         except KeyboardInterrupt:
             pass
         finally:
