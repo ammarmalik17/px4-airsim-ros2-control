@@ -19,6 +19,18 @@ param set COM_OF_LOSS_T 300.0
 
 Widens the OffboardControlMode freshness window (default 1 s) to cover the wall-clock vs sim-clock offset. `observed_offset` grows over a session (already ~141 s early), so choose a value larger than your longest expected drift. 300 s is comfortable headroom; raise to 600 for long sessions. The durable fix is keeping AirSim near real time (render caps / lockstep) so the offset stays small.
 
+### Choosing the smallest correct value (measure, don't guess)
+
+Do not just pick a big number: `COM_OF_LOSS_T` is also the delay before PX4's **real** offboard-loss failsafe fires, so an oversized value disables that protection for minutes. The accurate setting is the smallest value that still exceeds the accumulated clock offset for your longest session. Offset grows at roughly `(1 - RTF)` s/s (RTF = AirSim real-time factor).
+
+Measure the drift instead of guessing. With the node + agent running, watch the offset live:
+
+```
+ros2 topic echo /fmu/out/timesync_status
+```
+
+Take two `observed_offset` samples (microseconds) `dt` seconds apart, convert to seconds (`/1e6`), and compute `drift_s_per_min = (|offset2| - |offset1|) / dt * 60`. Then set `COM_OF_LOSS_T >= |observed_offset_now|(s) + drift_s_per_min * <longest session minutes>`, rounded up with ~25% margin.
+
 ## Battery failsafe bypass
 
 ```
@@ -26,6 +38,28 @@ param set CBRK_SUPPLY_CHK 894281
 ```
 
 AirSim's default battery model drains voltage very fast in sim time, so PX4's `battery_unhealthy` health flag trips within seconds of arming (drone takes off, failsafe fires, drone auto-lands, disarms). `894281` is the magic circuit-breaker value defined in `src/lib/circuit_breaker/circuit_breaker.h` (`CBRK_SUPPLY_CHK_KEY`) - required so nobody flips safety checks by accident.
+
+### Battery LEVEL failsafe (COM_LOW_BAT_ACT + thresholds)
+
+`CBRK_SUPPLY_CHK` only bypasses the **supply / unhealthy** preflight check. AirSim's fast drain ALSO trips the **battery-level** failsafe, which lands/RTS the drone even with the supply breaker set:
+
+```
+WARN  [failsafe] Failsafe activated
+INFO  [tone_alarm] battery warning (fast)
+ERROR [flight_mode_manager] Matching flight task was not able to run, Nav state: 1, Task: 1
+```
+
+The `flight_mode_manager` ERROR is downstream noise from the mid-failsafe mode change, not a separate bug. Disable the level failsafe action and raise its capacity thresholds (PX4 v1.16 params):
+
+```
+param set COM_LOW_BAT_ACT 0      # 0 = Warning only (was 3); 1=Return, 2=Land, 3=RTGS
+param set BAT_LOW_THR 0          # default 0.15 -> capacity warning level
+param set BAT_CRIT_THR 0         # default 0.07 -> Return level
+param set BAT_EMERGEN_THR 0      # default 0.05 -> Land (immediate) level
+param save
+```
+
+Note: `COM_BAT_ENABLE` / `COM_BAT_FS_ACT` seen in older guides were removed in PX4 v1.14+ - use the params above. Diagnose the tripping flag with `listener battery_status 1` and `listener failsafe_flags 1` (look for `battery_warning` / `battery_critical`).
 
 ## Persist
 
@@ -38,9 +72,10 @@ Verify after next boot:
 ```
 param show COM_OF_LOSS_T
 param show CBRK_SUPPLY_CHK
+param show COM_LOW_BAT_ACT
 ```
 
-Expected: `300.00000` and `894281`.
+Expected: `300.00000`, `894281`, and `0.00000`.
 
 ---
 
@@ -49,7 +84,7 @@ Expected: `300.00000` and `894281`.
 Paste into `pxh>`:
 
 ```
-param set COM_OF_LOSS_T 300.0 ; param set CBRK_SUPPLY_CHK 894281 ; param save
+param set COM_OF_LOSS_T 300.0 ; param set CBRK_SUPPLY_CHK 894281 ; param set COM_LOW_BAT_ACT 0 ; param set BAT_LOW_THR 0 ; param set BAT_CRIT_THR 0 ; param set BAT_EMERGEN_THR 0 ; param save
 ```
 
 ---
@@ -68,6 +103,28 @@ commander check                      # re-run preflight checks
 ```
 
 Note: uORB topic names are lowercase snake_case, not CamelCase.
+
+---
+
+## Silencing the `timesync` warning churn (optional)
+
+The recurring PX4-console lines
+
+```
+WARN  [timesync] time jump detected. Resetting time synchroniser.
+WARN  [uxrce_dds_client] time sync no longer converged
+INFO  [uxrce_dds_client] time sync converged
+```
+
+are the uXRCE-DDS time synchronizer trying (and failing) to pull PX4's `hrt` toward the agent's host wall clock while AirSim keeps advancing `hrt` in slow, stepped increments. Mostly cosmetic, but each reset yanks `hrt` and can feed irregular `dt` into `ekf2`.
+
+To stop the churn, disable the client-side time sync so PX4 keeps its own (AirSim-driven) clock:
+
+```
+param set UXRCE_DDS_SYNCT 0 ; param save
+```
+
+Caveat: this removes the log noise and the `hrt` jumps, but does **not** align the two clock domains -- the node still stamps setpoints with the wall clock, so the `COM_OF_LOSS_T` tolerance above is still required. Only a real `/clock` bridge (or AirSim lockstep) makes that value small again. Reference: PX4 ROS2 Issue #22522.
 
 ---
 

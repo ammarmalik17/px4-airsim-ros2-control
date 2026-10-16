@@ -3,6 +3,7 @@
 import math
 import queue
 import select
+import signal
 import sys
 import termios
 import threading
@@ -20,13 +21,21 @@ from px4_msgs.msg import (
     OffboardControlMode,
     TrajectorySetpoint,
     VehicleCommand,
-    VehicleLocalPosition,
     VehicleStatus,
 )
+
+# Default AirSim RPC endpoint (single source of truth; full ROS2 parameterization is tracked separately)
+AIRSIM_IP = "192.168.224.1"
+AIRSIM_PORT = 41451
 
 
 class AirSimOffboardControl(Node):
     """Node for controlling AirSim drone using ROS2 px4_msgs with keyboard input."""
+
+    PUBLISH_PERIOD_S = 0.05        # 20 Hz timer period; single source for timer + velocity-decay math
+    OFFBOARD_MIN_SETPOINTS = 10    # setpoints required before engage/takeoff/land are allowed
+    # key -> (velocity axis, step sign) for the table-driven movement dispatch
+    MOVEMENT_KEYS = {'w': (0, 1), 's': (0, -1), 'a': (1, -1), 'd': (1, 1), 'r': (2, -1), 'f': (2, 1)}
 
     def __init__(self) -> None:
         super().__init__('airsim_offboard_control')
@@ -48,26 +57,22 @@ class AirSimOffboardControl(Node):
             VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
 
         # Create subscribers
-        self.vehicle_local_position_subscriber = self.create_subscription(
-            VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
         self.vehicle_status_subscriber = self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status_v1', self.vehicle_status_callback, qos_profile)
 
         # Initialize variables
-        self.vehicle_local_position = VehicleLocalPosition()
         self.vehicle_status = VehicleStatus()
         self.offboard_mode_enabled = False
         self.offboard_setpoint_counter = 0
         
         # Control variables
-        self.target_position = [0.0, 0.0, -2.0]  # Start 2 meters above ground (NED frame)
         self.target_yaw = 0.0
-        self.control_step = 0.5  # Movement step in meters
         self.yaw_step = 0.2  # Yaw step in radians
         self.takeoff_altitude = 2.0  # Target altitude for auto takeoff (meters above ground)
         
         # Velocity control variables
         self.target_velocity = [0.0, 0.0, 0.0]
+        self._ctrl_lock = threading.Lock()  # Guards target_velocity/target_yaw across timer + keyboard threads
         self.max_velocity_horizontal = 5.0  # Maximum horizontal velocity in m/s (WASD)
         self.max_velocity_vertical = 10.0   # Maximum vertical velocity in m/s (RF)
         self.velocity_step = 0.5  # Velocity increment
@@ -75,12 +80,12 @@ class AirSimOffboardControl(Node):
         
         # Initialize AirSim connection
         self.airsim_client = None
-        self.airsim_ip = "192.168.224.1"
-        self.airsim_port = 41451
+        self.airsim_ip = AIRSIM_IP
+        self.airsim_port = AIRSIM_PORT
         self.connect_airsim()
 
         # Create a timer to publish control commands
-        self.timer = self.create_timer(0.05, self.timer_callback)  # 20Hz
+        self.timer = self.create_timer(self.PUBLISH_PERIOD_S, self.timer_callback)  # 20Hz
         
         # Keyboard input handling
         self.running = True
@@ -90,11 +95,14 @@ class AirSimOffboardControl(Node):
 
         # Video feed state
         self.video_running = False
+        self._video_stop = threading.Event()
         self.video_fetch_thread = None
         self.video_display_thread = None
         self.frame_queue = queue.Queue(maxsize=2)
         self.fetch_fps_smoothed = 0.0
         self.render_fps_smoothed = 0.0
+        self._last_fetch_err_log = 0.0
+        self._last_render_err_log = 0.0
         # Dedicated AirSim client for the video pipeline so its RPC session/IOLoop
         # is never shared with (or raced by) the main-thread control client.
         self.video_client = None
@@ -112,7 +120,7 @@ class AirSimOffboardControl(Node):
         print('  X: Stop (zero velocity)')
         print('  ESC: Exit')
         print()
-        print('IMPORTANT: Wait for 10 setpoints to be sent before pressing "O"')
+        print(f'IMPORTANT: Wait for {self.OFFBOARD_MIN_SETPOINTS} setpoints to be sent before pressing "O"')
         print('Note: Make sure this terminal has focus for keyboard input!')
         print('Velocity decays automatically when keys are released.')
 
@@ -126,12 +134,8 @@ class AirSimOffboardControl(Node):
             print('✓ Connected to AirSim successfully')
         except Exception as e:
             print(f'✗ Failed to connect to AirSim: {e}')
-            print('Make sure AirSim is running on Windows at 192.168.224.1:41451')
+            print(f'Make sure AirSim is running at {AIRSIM_IP}:{AIRSIM_PORT}')
             self.airsim_client = None
-
-    def vehicle_local_position_callback(self, vehicle_local_position):
-        """Callback function for vehicle_local_position topic subscriber."""
-        self.vehicle_local_position = vehicle_local_position
 
     def vehicle_status_callback(self, vehicle_status):
         """Callback function for vehicle_status topic subscriber."""
@@ -149,8 +153,8 @@ class AirSimOffboardControl(Node):
 
     def engage_offboard_mode(self):
         """Switch to offboard mode and verify that PX4 actually accepted it."""
-        if self.offboard_setpoint_counter < 10:
-            print(f"⚠ Need to send more setpoints before offboard mode ({self.offboard_setpoint_counter}/10)")
+        if self.offboard_setpoint_counter < self.OFFBOARD_MIN_SETPOINTS:
+            print(f"⚠ Need to send more setpoints before offboard mode ({self.offboard_setpoint_counter}/{self.OFFBOARD_MIN_SETPOINTS})")
             return
 
         print("🚁 Engaging offboard mode...")
@@ -177,19 +181,35 @@ class AirSimOffboardControl(Node):
         print(f"✗ Offboard NOT engaged. nav_state={self.vehicle_status.nav_state} "
               f"(expected {VehicleStatus.NAVIGATION_STATE_OFFBOARD}), "
               f"arming_state={self.vehicle_status.arming_state}")
-        print("  Likely cause: OffboardControlMode freshness check failing (AirSim time jumps).")
-        print("  In pxh>, run: `param set COM_OF_LOSS_T 5.0` and retry pressing 'O'.")
+        print("  Likely cause: OffboardControlMode freshness failing (wall-clock vs sim-clock drift).")
+        print("  See px4_params.md: COM_OF_LOSS_T must exceed the timesync observed_offset "
+              "(300.0 typical, 600.0 for long sessions). Verify with `param show COM_OF_LOSS_T`.")
 
     def disable_offboard_mode(self):
-        """Disable offboard mode."""
+        """Exit offboard by commanding AUTO LOITER and stop applying movement setpoints."""
         self.offboard_mode_enabled = False
-        self.target_velocity = [0.0, 0.0, 0.0]  # Stop movement
-        print("🛑 Offboard mode disabled")
+        with self._ctrl_lock:
+            self.target_velocity = [0.0, 0.0, 0.0]  # Stop movement
+        # Leave OFFBOARD: param1=1 custom base, param2=4 AUTO main mode,
+        # param3=3 AUTO_LOITER sub-mode (PX4_CUSTOM_SUB_MODE_AUTO_LOITER; 2 would be TAKEOFF).
+        # (CLI equivalent: `commander mode auto:loiter`, cf. px4_params.md diagnostics)
+        self.publish_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=4.0, param3=3.0)
+
+        # Poll vehicle_status_v1 up to 1 s to confirm the commander accepted AUTO LOITER,
+        # mirroring the OFFBOARD acceptance check in engage_offboard_mode.
+        for _ in range(20):
+            time.sleep(0.05)
+            if self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_AUTO_LOITER:
+                print("🛑 Offboard exited: AUTO LOITER engaged (hover)")
+                return
+        print(f"⚠ Offboard exit NOT confirmed. nav_state={self.vehicle_status.nav_state} "
+              f"(expected {VehicleStatus.NAVIGATION_STATE_AUTO_LOITER}); vehicle remains in OFFBOARD/hover")
 
     def takeoff(self):
         """Command PX4 to perform an auto takeoff to takeoff_altitude."""
-        if self.offboard_setpoint_counter < 10:
-            print(f"⚠ Need to send more setpoints before takeoff ({self.offboard_setpoint_counter}/10)")
+        if self.offboard_setpoint_counter < self.OFFBOARD_MIN_SETPOINTS:
+            print(f"⚠ Need to send more setpoints before takeoff ({self.offboard_setpoint_counter}/{self.OFFBOARD_MIN_SETPOINTS})")
             return
 
         # Arm only if not already armed (AUTO_TAKEOFF requires arming)
@@ -204,10 +224,11 @@ class AirSimOffboardControl(Node):
 
     def land(self):
         """Command PX4 to land and exit offboard control."""
-        if self.offboard_setpoint_counter < 10:
-            print(f"⚠ Need to send more setpoints before landing ({self.offboard_setpoint_counter}/10)")
+        if self.offboard_setpoint_counter < self.OFFBOARD_MIN_SETPOINTS:
+            print(f"⚠ Need to send more setpoints before landing ({self.offboard_setpoint_counter}/{self.OFFBOARD_MIN_SETPOINTS})")
             return
-        self.target_velocity = [0.0, 0.0, 0.0]  # Stop horizontal motion
+        with self._ctrl_lock:
+            self.target_velocity = [0.0, 0.0, 0.0]  # Stop horizontal motion
         self.offboard_mode_enabled = False  # Movement keys no longer apply once landing
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         print("🛬 Landing commanded")
@@ -226,15 +247,21 @@ class AirSimOffboardControl(Node):
     def publish_trajectory_setpoint(self):
         """Publish the trajectory setpoint."""
         msg = TrajectorySetpoint()
-        
+
+        # Read velocity/yaw under the lock so the timer never observes a list
+        # half-updated by the keyboard thread; release before publishing.
+        with self._ctrl_lock:
+            vx, vy, vz = self.target_velocity[0], self.target_velocity[1], self.target_velocity[2]
+            yaw = self.target_yaw
+
         # Use velocity control for more responsive movement
         msg.position = [float('nan'), float('nan'), float('nan')]  # Don't control position directly
-        msg.velocity = [float(self.target_velocity[0]), float(self.target_velocity[1]), float(self.target_velocity[2])]
+        msg.velocity = [float(vx), float(vy), float(vz)]
         msg.acceleration = [float('nan'), float('nan'), float('nan')]
-        msg.yaw = float(self.target_yaw)
+        msg.yaw = float(yaw)
         msg.yawspeed = 0.0
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        
+
         self.trajectory_setpoint_publisher.publish(msg)
 
     def publish_vehicle_command(self, command, **params) -> None:
@@ -265,19 +292,61 @@ class AirSimOffboardControl(Node):
         self.publish_offboard_control_mode()
         self.publish_trajectory_setpoint()
         
-        # Increment counter for PX4 offboard mode requirements
-        if self.offboard_setpoint_counter < 10:
-            self.offboard_setpoint_counter += 1
+        # Monotonic counter for the PX4 offboard-mode readiness requirement
+        self.offboard_setpoint_counter += 1
 
     def apply_velocity_decay(self):
         """Apply velocity decay to gradually stop the drone."""
-        decay_rate = self.velocity_decay * 0.05  # Timer runs at 20Hz (0.05s interval)
-        
-        for i in range(3):
-            if self.target_velocity[i] > 0:
-                self.target_velocity[i] = max(0, self.target_velocity[i] - decay_rate)
-            elif self.target_velocity[i] < 0:
-                self.target_velocity[i] = min(0, self.target_velocity[i] + decay_rate)
+        decay_rate = self.velocity_decay * self.PUBLISH_PERIOD_S  # timer period single-sourced via PUBLISH_PERIOD_S
+
+        with self._ctrl_lock:
+            for i in range(3):
+                if self.target_velocity[i] > 0:
+                    self.target_velocity[i] = max(0, self.target_velocity[i] - decay_rate)
+                elif self.target_velocity[i] < 0:
+                    self.target_velocity[i] = min(0, self.target_velocity[i] + decay_rate)
+
+    def _apply_axis_step(self, axis, sign):
+        """Advance one velocity axis by one step in `sign` direction under the lock."""
+        vmax = self.max_velocity_vertical if axis == 2 else self.max_velocity_horizontal
+        with self._ctrl_lock:
+            new = self.target_velocity[axis] + sign * self.velocity_step
+            new = max(-vmax, min(vmax, new))
+            self.target_velocity[axis] = new
+            v = self.target_velocity[axis]
+        self._report_axis(axis, v)
+
+    def _report_axis(self, axis, v):
+        """Reproduce the sign-based direction feedback (unchanged from the pre-refactor output)."""
+        if axis == 0:
+            if v >= 0:
+                print(f'⬆ Forward: {v:.1f} m/s')
+            else:
+                print(f'⬇ Backward: {abs(v):.1f} m/s')
+        elif axis == 1:
+            if v <= 0:
+                print(f'⬅ Left: {abs(v):.1f} m/s')
+            else:
+                print(f'➡ Right: {v:.1f} m/s')
+        elif axis == 2:
+            if v <= 0:
+                print(f'🔼 Up: {abs(v):.1f} m/s')
+            else:
+                print(f'🔽 Down: {v:.1f} m/s')
+
+    def _apply_yaw_step(self, sign):
+        """Rotate yaw by one step, wrapping to [-pi, pi], under the lock."""
+        with self._ctrl_lock:
+            self.target_yaw += sign * self.yaw_step
+            if self.target_yaw < -math.pi:
+                self.target_yaw += 2 * math.pi
+            elif self.target_yaw > math.pi:
+                self.target_yaw -= 2 * math.pi
+            yaw = self.target_yaw
+        if sign < 0:
+            print(f'↺ Yaw: {math.degrees(yaw):.0f}°')
+        else:
+            print(f'↻ Yaw: {math.degrees(yaw):.0f}°')
 
     def get_char(self):
         """Get a single character from stdin."""
@@ -333,7 +402,8 @@ class AirSimOffboardControl(Node):
                         self.disable_offboard_mode()
                 elif char == 'x':
                     # Stop all movement
-                    self.target_velocity = [0.0, 0.0, 0.0]
+                    with self._ctrl_lock:
+                        self.target_velocity = [0.0, 0.0, 0.0]
                     print('⏹ Stopping movement')
                 elif char == 't':
                     self.takeoff()
@@ -342,53 +412,15 @@ class AirSimOffboardControl(Node):
                 elif char == 'v':
                     self.toggle_video_feed()
                 elif self.offboard_mode_enabled:
-                    # Movement controls (only work in offboard mode)
-                    if char == 'w':  # Forward (North in NED)
-                        self.target_velocity[0] = min(self.target_velocity[0] + self.velocity_step, self.max_velocity_horizontal)
-                        if self.target_velocity[0] >= 0:
-                            print(f'⬆ Forward: {self.target_velocity[0]:.1f} m/s')
-                        else:
-                            print(f'⬇ Backward: {abs(self.target_velocity[0]):.1f} m/s')
-                    elif char == 's':  # Backward (South in NED)
-                        self.target_velocity[0] = max(self.target_velocity[0] - self.velocity_step, -self.max_velocity_horizontal)
-                        if self.target_velocity[0] <= 0:
-                            print(f'⬇ Backward: {abs(self.target_velocity[0]):.1f} m/s')
-                        else:
-                            print(f'⬆ Forward: {self.target_velocity[0]:.1f} m/s')
-                    elif char == 'a':  # Left (West in NED)
-                        self.target_velocity[1] = max(self.target_velocity[1] - self.velocity_step, -self.max_velocity_horizontal)
-                        if self.target_velocity[1] <= 0:
-                            print(f'⬅ Left: {abs(self.target_velocity[1]):.1f} m/s')
-                        else:
-                            print(f'➡ Right: {self.target_velocity[1]:.1f} m/s')
-                    elif char == 'd':  # Right (East in NED)
-                        self.target_velocity[1] = min(self.target_velocity[1] + self.velocity_step, self.max_velocity_horizontal)
-                        if self.target_velocity[1] >= 0:
-                            print(f'➡ Right: {self.target_velocity[1]:.1f} m/s')
-                        else:
-                            print(f'⬅ Left: {abs(self.target_velocity[1]):.1f} m/s')
-                    elif char == 'r':  # Up (negative Z in NED)
-                        self.target_velocity[2] = max(self.target_velocity[2] - self.velocity_step, -self.max_velocity_vertical)
-                        if self.target_velocity[2] <= 0:
-                            print(f'🔼 Up: {abs(self.target_velocity[2]):.1f} m/s')
-                        else:
-                            print(f'🔽 Down: {self.target_velocity[2]:.1f} m/s')
-                    elif char == 'f':  # Down (positive Z in NED)
-                        self.target_velocity[2] = min(self.target_velocity[2] + self.velocity_step, self.max_velocity_vertical)
-                        if self.target_velocity[2] >= 0:
-                            print(f'🔽 Down: {self.target_velocity[2]:.1f} m/s')
-                        else:
-                            print(f'🔼 Up: {abs(self.target_velocity[2]):.1f} m/s')
-                    elif char == 'q':  # Rotate left
-                        self.target_yaw -= self.yaw_step
-                        if self.target_yaw < -math.pi:
-                            self.target_yaw += 2 * math.pi
-                        print(f'↺ Yaw: {math.degrees(self.target_yaw):.0f}°')
-                    elif char == 'e':  # Rotate right
-                        self.target_yaw += self.yaw_step
-                        if self.target_yaw > math.pi:
-                            self.target_yaw -= 2 * math.pi
-                        print(f'↻ Yaw: {math.degrees(self.target_yaw):.0f}°')
+                    # Movement controls (only work in offboard mode); table-driven dispatch
+                    # centralizes the per-key clamp/feedback that was previously duplicated.
+                    if char in self.MOVEMENT_KEYS:
+                        axis, sign = self.MOVEMENT_KEYS[char]
+                        self._apply_axis_step(axis, sign)
+                    elif char == 'q':
+                        self._apply_yaw_step(-1)
+                    elif char == 'e':
+                        self._apply_yaw_step(1)
                 else:
                     if char in ['w', 'a', 's', 'd', 'r', 'f', 'q', 'e']:
                         print('⚠ Movement commands only work in offboard mode. Press "o" to enable.')
@@ -418,7 +450,7 @@ class AirSimOffboardControl(Node):
             try:
                 self.airsim_client.enableApiControl(False)
                 print('✓ AirSim API control disabled')
-            except:
+            except Exception:
                 pass
 
     def toggle_video_feed(self):
@@ -430,9 +462,6 @@ class AirSimOffboardControl(Node):
 
     def start_video_feed(self):
         """Start producer/consumer threads to display live video from AirSim."""
-        if cv2 is None or np is None:
-            print('⚠ OpenCV (cv2) and NumPy are required for video. Install with: pip install opencv-python numpy')
-            return
         if self.airsim_client is None:
             print('⚠ Cannot start video: not connected to AirSim')
             return
@@ -449,8 +478,17 @@ class AirSimOffboardControl(Node):
             self.video_client = None
             return
         self.video_running = True
+        self._video_stop.clear()
         self.fetch_fps_smoothed = 0.0
         self.render_fps_smoothed = 0.0
+        self._last_fetch_err_log = 0.0
+        self._last_render_err_log = 0.0
+        # Drop any frames left over from a previous session so a restart shows fresh video
+        while True:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
         # Start producer and consumer threads
         self.video_fetch_thread = threading.Thread(target=self.video_fetch_loop, daemon=True)
         self.video_display_thread = threading.Thread(target=self.video_display_loop, daemon=True)
@@ -463,11 +501,17 @@ class AirSimOffboardControl(Node):
         if not self.video_running:
             return
         self.video_running = False
-        # Give the thread a moment to exit its loop
-        time.sleep(0.05)
+        # Signal both video threads to exit, then join before touching the client so the
+        # fetch loop can no longer be mid-RPC on self.video_client (TOCTOU elimination).
+        self._video_stop.set()
+        if self.video_fetch_thread is not None:
+            self.video_fetch_thread.join(timeout=1.0)
+        if self.video_display_thread is not None:
+            self.video_display_thread.join(timeout=1.0)
+        self.video_fetch_thread = None
+        self.video_display_thread = None
         try:
-            if cv2 is not None:
-                cv2.destroyAllWindows()
+            cv2.destroyAllWindows()
         except Exception:
             pass
         # Close the dedicated video client (separate session from the main control client)
@@ -486,15 +530,18 @@ class AirSimOffboardControl(Node):
         prev_time = time.perf_counter()
         interval = 1.0 / self.video_target_fps if self.video_target_fps > 0 else 0.0
         next_tick = time.perf_counter()
-        while self.running and self.video_running and self.video_client is not None:
+        while self.running and not self._video_stop.is_set():
             try:
-                responses = self.video_client.simGetImages([
+                client = self.video_client
+                if client is None:
+                    break
+                responses = client.simGetImages([
                     airsim.ImageRequest("0", airsim.ImageType.Scene, pixels_as_float=False, compress=True)
                 ])
                 if not responses or responses[0] is None or responses[0].width == 0:
                     continue
-                arr = np.frombuffer(responses[0].image_data_uint8, dtype=np.uint8)  # type: ignore
-                frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # type: ignore
+                arr = np.frombuffer(responses[0].image_data_uint8, dtype=np.uint8)
+                frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame_bgr is None:
                     continue
                 # Update fetch FPS
@@ -516,7 +563,12 @@ class AirSimOffboardControl(Node):
                         self.frame_queue.put_nowait(frame_bgr)
                     except queue.Full:
                         pass
-            except Exception:
+            except Exception as e:
+                # Rate-limited log so a persistent RPC/decode failure is visible but not spammy
+                now = time.monotonic()
+                if now - self._last_fetch_err_log >= 1.0:
+                    self.get_logger().warning(f'Video fetch error: {e}')
+                    self._last_fetch_err_log = now
                 # Reset the pacing baseline after a stall to avoid a sleep burst
                 next_tick = time.perf_counter()
             finally:
@@ -531,13 +583,13 @@ class AirSimOffboardControl(Node):
         """Consumer thread: display latest frames from queue with FPS overlay."""
         window_name = 'AirSim Camera'
         try:
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)  # type: ignore
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         except Exception:
             pass
         alpha = 0.9
         prev_time = time.perf_counter()
         last_frame = None
-        while self.running and self.video_running:
+        while self.running and not self._video_stop.is_set():
             try:
                 frame = None
                 # Get at least one frame (blocking up to 100 ms)
@@ -564,37 +616,50 @@ class AirSimOffboardControl(Node):
                 # Overlay FPS: fetch and render
                 try:
                     text = f"F:{self.fetch_fps_smoothed:.1f} | R:{self.render_fps_smoothed:.1f} FPS"
-                    cv2.putText(frame, text, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)  # type: ignore
+                    cv2.putText(frame, text, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
                 except Exception:
                     pass
-                cv2.imshow(window_name, frame)  # type: ignore
-                cv2.waitKey(1)  # type: ignore
-            except Exception:
+                cv2.imshow(window_name, frame)
+                cv2.waitKey(1)
+            except Exception as e:
+                now = time.monotonic()
+                if now - self._last_render_err_log >= 1.0:
+                    self.get_logger().warning(f'Video render error: {e}')
+                    self._last_render_err_log = now
                 time.sleep(0.005)
         # Window closed in stop_video_feed
 
 
 def main(args=None) -> None:
     print('Starting AirSim Offboard Control Node...')
-    print('Make sure AirSim is running on Windows at 192.168.100.10 and accessible from Jetson')
+    print(f'Make sure AirSim is running and reachable at {AIRSIM_IP}:{AIRSIM_PORT}')
     
     rclpy.init(args=args)
     
     try:
         offboard_control = AirSimOffboardControl()
-        
-        # Handle shutdown gracefully
-        def signal_handler():
+
+        def cleanup():
             offboard_control.shutdown()
-            
+
+        def _handle_signal(signum, frame):
+            # Only flag the loop to stop; cleanup runs once from the finally below.
+            offboard_control.running = False
+
+        # Handle SIGINT/SIGTERM (e.g. `ros2 launch` shutdown, `kill`) gracefully while
+        # preserving rclpy's own handlers by restoring them afterward.
+        prev_sigint = signal.signal(signal.SIGINT, _handle_signal)
+        prev_sigterm = signal.signal(signal.SIGTERM, _handle_signal)
         try:
-            # Poll spin_once so we exit cleanly when the keyboard thread sets running=False
+            # Poll spin_once so we exit cleanly when the keyboard thread or a signal sets running=False
             while rclpy.ok() and offboard_control.running:
                 rclpy.spin_once(offboard_control, timeout_sec=0.1)
         except KeyboardInterrupt:
             pass
         finally:
-            signal_handler()
+            signal.signal(signal.SIGINT, prev_sigint)
+            signal.signal(signal.SIGTERM, prev_sigterm)
+            cleanup()
             offboard_control.destroy_node()
             
     except Exception as e:
@@ -602,7 +667,7 @@ def main(args=None) -> None:
     finally:
         try:
             rclpy.shutdown()
-        except:
+        except Exception:
             pass
 
 
