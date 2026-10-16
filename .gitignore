@@ -4,3 +4,4 @@ log/
 .gitignore
 .qoderignore
 venv/
+__pycache__/

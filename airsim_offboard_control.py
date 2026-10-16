@@ -64,6 +64,7 @@ class AirSimOffboardControl(Node):
         self.target_yaw = 0.0
         self.control_step = 0.5  # Movement step in meters
         self.yaw_step = 0.2  # Yaw step in radians
+        self.takeoff_altitude = 2.0  # Target altitude for auto takeoff (meters above ground)
         
         # Velocity control variables
         self.target_velocity = [0.0, 0.0, 0.0]
@@ -74,6 +75,8 @@ class AirSimOffboardControl(Node):
         
         # Initialize AirSim connection
         self.airsim_client = None
+        self.airsim_ip = "192.168.224.1"
+        self.airsim_port = 41451
         self.connect_airsim()
 
         # Create a timer to publish control commands
@@ -92,6 +95,10 @@ class AirSimOffboardControl(Node):
         self.frame_queue = queue.Queue(maxsize=2)
         self.fetch_fps_smoothed = 0.0
         self.render_fps_smoothed = 0.0
+        # Dedicated AirSim client for the video pipeline so its RPC session/IOLoop
+        # is never shared with (or raced by) the main-thread control client.
+        self.video_client = None
+        self.video_target_fps = 30.0
         
         print('Controls:')
         print('  W/S: Forward/Backward (max 5 m/s)')
@@ -100,6 +107,8 @@ class AirSimOffboardControl(Node):
         print('  Q/E: Rotate Left/Right')
         print('  O: Toggle Offboard Mode')
         print('  V: Toggle AirSim Video Feed')
+        print('  T: Takeoff')
+        print('  L: Land')
         print('  X: Stop (zero velocity)')
         print('  ESC: Exit')
         print()
@@ -110,8 +119,8 @@ class AirSimOffboardControl(Node):
     def connect_airsim(self):
         """Connect to AirSim running on Windows."""
         try:
-            print('Connecting to AirSim at 192.168.224.1:41451...')
-            self.airsim_client = airsim.MultirotorClient(ip="192.168.224.1", port=41451)
+            print(f'Connecting to AirSim at {self.airsim_ip}:{self.airsim_port}...')
+            self.airsim_client = airsim.MultirotorClient(ip=self.airsim_ip, port=self.airsim_port)
             self.airsim_client.confirmConnection()
             self.airsim_client.enableApiControl(True)
             print('✓ Connected to AirSim successfully')
@@ -176,6 +185,32 @@ class AirSimOffboardControl(Node):
         self.offboard_mode_enabled = False
         self.target_velocity = [0.0, 0.0, 0.0]  # Stop movement
         print("🛑 Offboard mode disabled")
+
+    def takeoff(self):
+        """Command PX4 to perform an auto takeoff to takeoff_altitude."""
+        if self.offboard_setpoint_counter < 10:
+            print(f"⚠ Need to send more setpoints before takeoff ({self.offboard_setpoint_counter}/10)")
+            return
+
+        # Arm only if not already armed (AUTO_TAKEOFF requires arming)
+        if self.vehicle_status.arming_state != VehicleStatus.ARMING_STATE_ARMED:
+            self.arm()
+            time.sleep(0.1)
+
+        self.offboard_mode_enabled = False  # Leaving offboard for the auto-takeoff sequence
+        self.publish_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF, param7=self.takeoff_altitude)
+        print(f"🛫 Takeoff commanded to {self.takeoff_altitude:.1f} m")
+
+    def land(self):
+        """Command PX4 to land and exit offboard control."""
+        if self.offboard_setpoint_counter < 10:
+            print(f"⚠ Need to send more setpoints before landing ({self.offboard_setpoint_counter}/10)")
+            return
+        self.target_velocity = [0.0, 0.0, 0.0]  # Stop horizontal motion
+        self.offboard_mode_enabled = False  # Movement keys no longer apply once landing
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+        print("🛬 Landing commanded")
 
     def publish_offboard_control_mode(self):
         """Publish the offboard control mode."""
@@ -300,6 +335,10 @@ class AirSimOffboardControl(Node):
                     # Stop all movement
                     self.target_velocity = [0.0, 0.0, 0.0]
                     print('⏹ Stopping movement')
+                elif char == 't':
+                    self.takeoff()
+                elif char == 'l':
+                    self.land()
                 elif char == 'v':
                     self.toggle_video_feed()
                 elif self.offboard_mode_enabled:
@@ -399,6 +438,16 @@ class AirSimOffboardControl(Node):
             return
         if self.video_running:
             return
+        # Create a dedicated AirSim client for the video pipeline so its RPC
+        # session/IOLoop is used only by the video threads, never contending
+        # with the main-thread control client (self.airsim_client).
+        try:
+            self.video_client = airsim.MultirotorClient(ip=self.airsim_ip, port=self.airsim_port)
+            self.video_client.confirmConnection()
+        except Exception as e:
+            print(f'\u26a0 Cannot start video: failed to connect dedicated client: {e}')
+            self.video_client = None
+            return
         self.video_running = True
         self.fetch_fps_smoothed = 0.0
         self.render_fps_smoothed = 0.0
@@ -421,35 +470,32 @@ class AirSimOffboardControl(Node):
                 cv2.destroyAllWindows()
         except Exception:
             pass
+        # Close the dedicated video client (separate session from the main control client)
+        if self.video_client is not None:
+            try:
+                self.video_client.close()
+            except Exception:
+                pass
+            self.video_client = None
         print('🖥 AirSim video feed OFF')
 
     def video_fetch_loop(self):
-        """Producer thread: fetch frames from AirSim as uncompressed and push latest to queue."""
+        """Producer thread: fetch compressed frames via the dedicated video client,
+        decode them with OpenCV, and push the latest to the queue at a capped rate."""
         alpha = 0.9
         prev_time = time.perf_counter()
-        while self.running and self.video_running:
+        interval = 1.0 / self.video_target_fps if self.video_target_fps > 0 else 0.0
+        next_tick = time.perf_counter()
+        while self.running and self.video_running and self.video_client is not None:
             try:
-                responses = self.airsim_client.simGetImages([
-                    airsim.ImageRequest("0", airsim.ImageType.Scene, pixels_as_float=False, compress=False)
+                responses = self.video_client.simGetImages([
+                    airsim.ImageRequest("0", airsim.ImageType.Scene, pixels_as_float=False, compress=True)
                 ])
                 if not responses or responses[0] is None or responses[0].width == 0:
-                    time.sleep(0.005)
                     continue
-                img1d = np.frombuffer(responses[0].image_data_uint8, dtype=np.uint8)  # type: ignore
-                width = responses[0].width
-                height = responses[0].height
-                expected_rgb = width * height * 3
-                expected_rgba = width * height * 4
-                frame_bgr = None
-                if img1d.size == expected_rgba:
-                    img_bgra = img1d
-                    img_bgra.shape = (height, width, 4)
-                    frame_bgr = img_bgra[:, :, :3]
-                elif img1d.size == expected_rgb:
-                    frame_bgr = img1d
-                    frame_bgr.shape = (height, width, 3)
-                else:
-                    time.sleep(0.002)
+                arr = np.frombuffer(responses[0].image_data_uint8, dtype=np.uint8)  # type: ignore
+                frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # type: ignore
+                if frame_bgr is None:
                     continue
                 # Update fetch FPS
                 now = time.perf_counter()
@@ -471,7 +517,15 @@ class AirSimOffboardControl(Node):
                     except queue.Full:
                         pass
             except Exception:
-                time.sleep(0.005)
+                # Reset the pacing baseline after a stall to avoid a sleep burst
+                next_tick = time.perf_counter()
+            finally:
+                # Pace the loop to video_target_fps (runs on success, continue and error paths)
+                if interval > 0:
+                    next_tick += interval
+                    delay = next_tick - time.perf_counter()
+                    if delay > 0:
+                        time.sleep(delay)
 
     def video_display_loop(self):
         """Consumer thread: display latest frames from queue with FPS overlay."""
