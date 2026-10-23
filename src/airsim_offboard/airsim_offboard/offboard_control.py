@@ -24,6 +24,9 @@ from px4_msgs.msg import (
     VehicleStatus,
 )
 
+from .velocity import decay_velocity, step_axis, wrap_yaw
+
+
 class AirSimOffboardControl(Node):
     """Node for controlling AirSim drone using ROS2 px4_msgs with keyboard input."""
 
@@ -389,19 +392,15 @@ class AirSimOffboardControl(Node):
 
         with self._ctrl_lock:
             for i in range(3):
-                if self.target_velocity[i] > 0:
-                    self.target_velocity[i] = max(0, self.target_velocity[i] - decay_rate)
-                elif self.target_velocity[i] < 0:
-                    self.target_velocity[i] = min(0, self.target_velocity[i] + decay_rate)
+                self.target_velocity[i] = decay_velocity(self.target_velocity[i], decay_rate)
 
     def _apply_axis_step(self, axis, sign):
         """Advance one velocity axis by one step in `sign` direction under the lock."""
         vmax = self.max_velocity_vertical if axis == 2 else self.max_velocity_horizontal
         with self._ctrl_lock:
-            new = self.target_velocity[axis] + sign * self.velocity_step
-            new = max(-vmax, min(vmax, new))
+            new = step_axis(self.target_velocity[axis], sign, self.velocity_step, vmax)
             self.target_velocity[axis] = new
-            v = self.target_velocity[axis]
+            v = new
         self._report_axis(axis, v)
 
     def _report_axis(self, axis, v):
@@ -425,11 +424,7 @@ class AirSimOffboardControl(Node):
     def _apply_yaw_step(self, sign):
         """Rotate yaw by one step, wrapping to [-pi, pi], under the lock."""
         with self._ctrl_lock:
-            self.target_yaw += sign * self.yaw_step
-            if self.target_yaw < -math.pi:
-                self.target_yaw += 2 * math.pi
-            elif self.target_yaw > math.pi:
-                self.target_yaw -= 2 * math.pi
+            self.target_yaw = wrap_yaw(self.target_yaw + sign * self.yaw_step)
             yaw = self.target_yaw
         if sign < 0:
             print(f'↺ Yaw: {math.degrees(yaw):.0f}°')
