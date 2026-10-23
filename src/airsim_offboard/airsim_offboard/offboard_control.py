@@ -24,41 +24,76 @@ from px4_msgs.msg import (
     VehicleStatus,
 )
 
-# Default AirSim RPC endpoint (single source of truth; full ROS2 parameterization is tracked separately)
-AIRSIM_IP = "192.168.224.1"
-AIRSIM_PORT = 41451
-
-
 class AirSimOffboardControl(Node):
     """Node for controlling AirSim drone using ROS2 px4_msgs with keyboard input."""
 
-    PUBLISH_PERIOD_S = 0.05        # 20 Hz timer period; single source for timer + velocity-decay math
-    OFFBOARD_MIN_SETPOINTS = 10    # setpoints required before engage/takeoff/land are allowed
     # key -> (velocity axis, step sign) for the table-driven movement dispatch
     MOVEMENT_KEYS = {'w': (0, 1), 's': (0, -1), 'a': (1, -1), 'd': (1, 1), 'r': (2, -1), 'f': (2, 1)}
+
+    # Parameter names and defaults; overridden by config/params.yaml or launch arguments.
+    PARAMETER_DEFAULTS = {
+        'airsim.ip': '192.168.224.1',
+        'airsim.port': 41451,
+        'airsim.vehicle_name': '',
+        'airsim.camera': '0',
+        'topic.offboard_control_mode': '/fmu/in/offboard_control_mode',
+        'topic.trajectory_setpoint': '/fmu/in/trajectory_setpoint',
+        'topic.vehicle_command': '/fmu/in/vehicle_command',
+        # PX4 v1.16 renamed VehicleStatus because MESSAGE_VERSION=1: the version suffix is required.
+        'topic.vehicle_status': '/fmu/out/vehicle_status_v1',
+        'vehicle.target_system': 1,
+        'vehicle.target_component': 1,
+        'control.publish_period_s': 0.05,      # 20 Hz; also the velocity-decay timestep
+        'control.offboard_min_setpoints': 10,  # setpoints required before engage/takeoff/land
+        'control.takeoff_altitude': 2.0,
+        'velocity.max_horizontal': 5.0,
+        'velocity.max_vertical': 10.0,
+        'velocity.step': 0.5,
+        'velocity.decay': 1.0,
+        'yaw.step': 0.2,
+        'video.target_fps': 30.0,
+        'video.queue_size': 2,
+        'video.window_name': 'AirSim Camera',
+        'qos.reliability': 'best_effort',
+        'qos.durability': 'transient_local',
+        'qos.depth': 1,
+    }
+
+    # String values accepted by the qos.* parameters.
+    RELIABILITY_POLICIES = {
+        'best_effort': ReliabilityPolicy.BEST_EFFORT,
+        'reliable': ReliabilityPolicy.RELIABLE,
+    }
+    DURABILITY_POLICIES = {
+        'transient_local': DurabilityPolicy.TRANSIENT_LOCAL,
+        'volatile': DurabilityPolicy.VOLATILE,
+    }
 
     def __init__(self) -> None:
         super().__init__('airsim_offboard_control')
 
+        # Parameters first: QoS, topics, the timer and the frame queue all depend on them.
+        self._declare_parameters()
+
         # Configure QoS profile for publishing and subscribing
         qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=self.qos_reliability,
+            durability=self.qos_durability,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=self.qos_depth
         )
 
         # Create publishers
         self.offboard_control_mode_publisher = self.create_publisher(
-            OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
+            OffboardControlMode, self.topic_offboard_control_mode, qos_profile)
         self.trajectory_setpoint_publisher = self.create_publisher(
-            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
+            TrajectorySetpoint, self.topic_trajectory_setpoint, qos_profile)
         self.vehicle_command_publisher = self.create_publisher(
-            VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
+            VehicleCommand, self.topic_vehicle_command, qos_profile)
 
         # Create subscribers
         self.vehicle_status_subscriber = self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status_v1', self.vehicle_status_callback, qos_profile)
+            VehicleStatus, self.topic_vehicle_status, self.vehicle_status_callback, qos_profile)
 
         # Initialize variables
         self.vehicle_status = VehicleStatus()
@@ -67,25 +102,17 @@ class AirSimOffboardControl(Node):
         
         # Control variables
         self.target_yaw = 0.0
-        self.yaw_step = 0.2  # Yaw step in radians
-        self.takeoff_altitude = 2.0  # Target altitude for auto takeoff (meters above ground)
-        
+
         # Velocity control variables
         self.target_velocity = [0.0, 0.0, 0.0]
         self._ctrl_lock = threading.Lock()  # Guards target_velocity/target_yaw across timer + keyboard threads
-        self.max_velocity_horizontal = 5.0  # Maximum horizontal velocity in m/s (WASD)
-        self.max_velocity_vertical = 10.0   # Maximum vertical velocity in m/s (RF)
-        self.velocity_step = 0.5  # Velocity increment
-        self.velocity_decay = 1.0  # Velocity decay per second
-        
-        # Initialize AirSim connection
+
+        # Initialize AirSim connection using the airsim.* parameters
         self.airsim_client = None
-        self.airsim_ip = AIRSIM_IP
-        self.airsim_port = AIRSIM_PORT
         self.connect_airsim()
 
         # Create a timer to publish control commands
-        self.timer = self.create_timer(self.PUBLISH_PERIOD_S, self.timer_callback)  # 20Hz
+        self.timer = self.create_timer(self.publish_period_s, self.timer_callback)  # 20Hz by default
         
         # Keyboard input handling
         self.running = True
@@ -98,7 +125,7 @@ class AirSimOffboardControl(Node):
         self._video_stop = threading.Event()
         self.video_fetch_thread = None
         self.video_display_thread = None
-        self.frame_queue = queue.Queue(maxsize=2)
+        self.frame_queue = queue.Queue(maxsize=self.video_queue_size)
         self.fetch_fps_smoothed = 0.0
         self.render_fps_smoothed = 0.0
         self._last_fetch_err_log = 0.0
@@ -106,12 +133,11 @@ class AirSimOffboardControl(Node):
         # Dedicated AirSim client for the video pipeline so its RPC session/IOLoop
         # is never shared with (or raced by) the main-thread control client.
         self.video_client = None
-        self.video_target_fps = 30.0
-        
+
         print('Controls:')
-        print('  W/S: Forward/Backward (max 5 m/s)')
-        print('  A/D: Left/Right (max 5 m/s)')
-        print('  R/F: Up/Down (max 10 m/s)')
+        print(f'  W/S: Forward/Backward (max {self.max_velocity_horizontal:.0f} m/s)')
+        print(f'  A/D: Left/Right (max {self.max_velocity_horizontal:.0f} m/s)')
+        print(f'  R/F: Up/Down (max {self.max_velocity_vertical:.0f} m/s)')
         print('  Q/E: Rotate Left/Right')
         print('  O: Toggle Offboard Mode')
         print('  V: Toggle AirSim Video Feed')
@@ -120,21 +146,83 @@ class AirSimOffboardControl(Node):
         print('  X: Stop (zero velocity)')
         print('  ESC: Exit')
         print()
-        print(f'IMPORTANT: Wait for {self.OFFBOARD_MIN_SETPOINTS} setpoints to be sent before pressing "O"')
+        print(f'IMPORTANT: Wait for {self.offboard_min_setpoints} setpoints to be sent before pressing "O"')
         print('Note: Make sure this terminal has focus for keyboard input!')
         print('Velocity decays automatically when keys are released.')
+
+    def _declare_parameters(self) -> None:
+        """Declare every tunable value and bind it to an attribute.
+
+        Must run before any QoS, publisher, timer or frame-queue creation, since all of
+        them read the attributes declared here.
+        """
+        for name, default in self.PARAMETER_DEFAULTS.items():
+            self.declare_parameter(name, default)
+
+        get = self.get_parameter
+
+        # AirSim RPC endpoint and vehicle selection
+        self.airsim_ip = get('airsim.ip').value
+        self.airsim_port = get('airsim.port').value
+        self.airsim_vehicle_name = get('airsim.vehicle_name').value
+        self.airsim_camera = get('airsim.camera').value
+
+        # PX4 uORB topics exposed over uXRCE-DDS
+        self.topic_offboard_control_mode = get('topic.offboard_control_mode').value
+        self.topic_trajectory_setpoint = get('topic.trajectory_setpoint').value
+        self.topic_vehicle_command = get('topic.vehicle_command').value
+        self.topic_vehicle_status = get('topic.vehicle_status').value
+
+        # VehicleCommand addressing (change for multi-vehicle / namespaced setups)
+        self.target_system = get('vehicle.target_system').value
+        self.target_component = get('vehicle.target_component').value
+
+        # Offboard pacing and mode-entry gating
+        self.publish_period_s = get('control.publish_period_s').value
+        self.offboard_min_setpoints = get('control.offboard_min_setpoints').value
+        self.takeoff_altitude = get('control.takeoff_altitude').value
+
+        # Velocity command shaping
+        self.max_velocity_horizontal = get('velocity.max_horizontal').value
+        self.max_velocity_vertical = get('velocity.max_vertical').value
+        self.velocity_step = get('velocity.step').value
+        self.velocity_decay = get('velocity.decay').value
+
+        self.yaw_step = get('yaw.step').value
+
+        # Camera pipeline
+        self.video_target_fps = get('video.target_fps').value
+        self.video_queue_size = get('video.queue_size').value
+        self.video_window_name = get('video.window_name').value
+
+        # QoS
+        self.qos_reliability = self._qos_policy(
+            'qos.reliability', self.RELIABILITY_POLICIES, 'best_effort')
+        self.qos_durability = self._qos_policy(
+            'qos.durability', self.DURABILITY_POLICIES, 'transient_local')
+        self.qos_depth = get('qos.depth').value
+
+    def _qos_policy(self, name, table, default_key):
+        """Map a string parameter onto an rclpy policy enum, falling back with a warning."""
+        value = self.get_parameter(name).value
+        if value in table:
+            return table[value]
+        self.get_logger().warning(
+            f"Unknown value '{value}' for parameter '{name}'; using '{default_key}'")
+        return table[default_key]
 
     def connect_airsim(self):
         """Connect to AirSim running on Windows."""
         try:
             print(f'Connecting to AirSim at {self.airsim_ip}:{self.airsim_port}...')
-            self.airsim_client = airsim.MultirotorClient(ip=self.airsim_ip, port=self.airsim_port)
+            self.airsim_client = airsim.MultirotorClient(
+                ip=self.airsim_ip, port=self.airsim_port, vehicle_name=self.airsim_vehicle_name)
             self.airsim_client.confirmConnection()
             self.airsim_client.enableApiControl(True)
             print('✓ Connected to AirSim successfully')
         except Exception as e:
             print(f'✗ Failed to connect to AirSim: {e}')
-            print(f'Make sure AirSim is running at {AIRSIM_IP}:{AIRSIM_PORT}')
+            print(f'Make sure AirSim is running at {self.airsim_ip}:{self.airsim_port}')
             self.airsim_client = None
 
     def vehicle_status_callback(self, vehicle_status):
@@ -153,8 +241,8 @@ class AirSimOffboardControl(Node):
 
     def engage_offboard_mode(self):
         """Switch to offboard mode and verify that PX4 actually accepted it."""
-        if self.offboard_setpoint_counter < self.OFFBOARD_MIN_SETPOINTS:
-            print(f"⚠ Need to send more setpoints before offboard mode ({self.offboard_setpoint_counter}/{self.OFFBOARD_MIN_SETPOINTS})")
+        if self.offboard_setpoint_counter < self.offboard_min_setpoints:
+            print(f"⚠ Need to send more setpoints before offboard mode ({self.offboard_setpoint_counter}/{self.offboard_min_setpoints})")
             return
 
         print("🚁 Engaging offboard mode...")
@@ -208,8 +296,8 @@ class AirSimOffboardControl(Node):
 
     def takeoff(self):
         """Command PX4 to perform an auto takeoff to takeoff_altitude."""
-        if self.offboard_setpoint_counter < self.OFFBOARD_MIN_SETPOINTS:
-            print(f"⚠ Need to send more setpoints before takeoff ({self.offboard_setpoint_counter}/{self.OFFBOARD_MIN_SETPOINTS})")
+        if self.offboard_setpoint_counter < self.offboard_min_setpoints:
+            print(f"⚠ Need to send more setpoints before takeoff ({self.offboard_setpoint_counter}/{self.offboard_min_setpoints})")
             return
 
         # Arm only if not already armed (AUTO_TAKEOFF requires arming)
@@ -224,8 +312,8 @@ class AirSimOffboardControl(Node):
 
     def land(self):
         """Command PX4 to land and exit offboard control."""
-        if self.offboard_setpoint_counter < self.OFFBOARD_MIN_SETPOINTS:
-            print(f"⚠ Need to send more setpoints before landing ({self.offboard_setpoint_counter}/{self.OFFBOARD_MIN_SETPOINTS})")
+        if self.offboard_setpoint_counter < self.offboard_min_setpoints:
+            print(f"⚠ Need to send more setpoints before landing ({self.offboard_setpoint_counter}/{self.offboard_min_setpoints})")
             return
         with self._ctrl_lock:
             self.target_velocity = [0.0, 0.0, 0.0]  # Stop horizontal motion
@@ -275,8 +363,8 @@ class AirSimOffboardControl(Node):
         msg.param5 = params.get("param5", 0.0)
         msg.param6 = params.get("param6", 0.0)
         msg.param7 = params.get("param7", 0.0)
-        msg.target_system = 1
-        msg.target_component = 1
+        msg.target_system = self.target_system
+        msg.target_component = self.target_component
         msg.source_system = 1
         msg.source_component = 1
         msg.from_external = True
@@ -297,7 +385,7 @@ class AirSimOffboardControl(Node):
 
     def apply_velocity_decay(self):
         """Apply velocity decay to gradually stop the drone."""
-        decay_rate = self.velocity_decay * self.PUBLISH_PERIOD_S  # timer period single-sourced via PUBLISH_PERIOD_S
+        decay_rate = self.velocity_decay * self.publish_period_s  # same period as the timer
 
         with self._ctrl_lock:
             for i in range(3):
@@ -471,7 +559,8 @@ class AirSimOffboardControl(Node):
         # session/IOLoop is used only by the video threads, never contending
         # with the main-thread control client (self.airsim_client).
         try:
-            self.video_client = airsim.MultirotorClient(ip=self.airsim_ip, port=self.airsim_port)
+            self.video_client = airsim.MultirotorClient(
+                ip=self.airsim_ip, port=self.airsim_port, vehicle_name=self.airsim_vehicle_name)
             self.video_client.confirmConnection()
         except Exception as e:
             print(f'\u26a0 Cannot start video: failed to connect dedicated client: {e}')
@@ -536,7 +625,9 @@ class AirSimOffboardControl(Node):
                 if client is None:
                     break
                 responses = client.simGetImages([
-                    airsim.ImageRequest("0", airsim.ImageType.Scene, pixels_as_float=False, compress=True)
+                    airsim.ImageRequest(
+                        self.airsim_camera, airsim.ImageType.Scene,
+                        pixels_as_float=False, compress=True)
                 ])
                 if not responses or responses[0] is None or responses[0].width == 0:
                     continue
@@ -581,7 +672,7 @@ class AirSimOffboardControl(Node):
 
     def video_display_loop(self):
         """Consumer thread: display latest frames from queue with FPS overlay."""
-        window_name = 'AirSim Camera'
+        window_name = self.video_window_name
         try:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         except Exception:
@@ -632,12 +723,13 @@ class AirSimOffboardControl(Node):
 
 def main(args=None) -> None:
     print('Starting AirSim Offboard Control Node...')
-    print(f'Make sure AirSim is running and reachable at {AIRSIM_IP}:{AIRSIM_PORT}')
-    
+
     rclpy.init(args=args)
-    
+
     try:
         offboard_control = AirSimOffboardControl()
+        print(f'AirSim endpoint: {offboard_control.airsim_ip}:{offboard_control.airsim_port} '
+              f'(vehicle_name={offboard_control.airsim_vehicle_name!r})')
 
         def cleanup():
             offboard_control.shutdown()

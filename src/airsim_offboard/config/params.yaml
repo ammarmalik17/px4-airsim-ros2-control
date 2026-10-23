@@ -1,0 +1,34 @@
+airsim_offboard_control:
+  ros__parameters:
+    airsim:
+      ip: "192.168.224.1"        # WSL2 NAT gateway to the Windows-side AirSim Blocks instance
+      port: 41451
+      vehicle_name: ""           # empty selects the default vehicle in settings.json
+      camera: "0"
+    topic:
+      offboard_control_mode: "/fmu/in/offboard_control_mode"
+      trajectory_setpoint: "/fmu/in/trajectory_setpoint"
+      vehicle_command: "/fmu/in/vehicle_command"
+      vehicle_status: "/fmu/out/vehicle_status_v1"   # PX4 v1.16 MESSAGE_VERSION=1 suffix
+    vehicle:
+      target_system: 1           # raise for multi-vehicle setups (one instance per vehicle)
+      target_component: 1
+    control:
+      publish_period_s: 0.05     # 20 Hz; also the velocity-decay timestep
+      offboard_min_setpoints: 10
+      takeoff_altitude: 2.0
+    velocity:
+      max_horizontal: 5.0        # m/s, WASD
+      max_vertical: 10.0         # m/s, R/F
+      step: 0.5
+      decay: 1.0                 # m/s^2
+    yaw:
+      step: 0.2                  # radians per Q/E press
+    video:
+      target_fps: 30.0
+      queue_size: 2
+      window_name: "AirSim Camera"
+    qos:
+      reliability: "best_effort"   # best_effort | reliable
+      durability: "transient_local" # transient_local | volatile
+      depth: 1
