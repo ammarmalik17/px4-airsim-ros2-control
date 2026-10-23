@@ -218,10 +218,10 @@ class AirSimOffboardControl(Node):
         """Connect to AirSim running on Windows."""
         try:
             print(f'Connecting to AirSim at {self.airsim_ip}:{self.airsim_port}...')
-            self.airsim_client = airsim.MultirotorClient(
-                ip=self.airsim_ip, port=self.airsim_port, vehicle_name=self.airsim_vehicle_name)
+            # airsim 1.8.1 has no vehicle_name constructor argument; it is per-call.
+            self.airsim_client = airsim.MultirotorClient(ip=self.airsim_ip, port=self.airsim_port)
             self.airsim_client.confirmConnection()
-            self.airsim_client.enableApiControl(True)
+            self.airsim_client.enableApiControl(True, vehicle_name=self.airsim_vehicle_name)
             print('✓ Connected to AirSim successfully')
         except Exception as e:
             print(f'✗ Failed to connect to AirSim: {e}')
@@ -554,8 +554,7 @@ class AirSimOffboardControl(Node):
         # session/IOLoop is used only by the video threads, never contending
         # with the main-thread control client (self.airsim_client).
         try:
-            self.video_client = airsim.MultirotorClient(
-                ip=self.airsim_ip, port=self.airsim_port, vehicle_name=self.airsim_vehicle_name)
+            self.video_client = airsim.MultirotorClient(ip=self.airsim_ip, port=self.airsim_port)
             self.video_client.confirmConnection()
         except Exception as e:
             print(f'\u26a0 Cannot start video: failed to connect dedicated client: {e}')
@@ -619,11 +618,11 @@ class AirSimOffboardControl(Node):
                 client = self.video_client
                 if client is None:
                     break
-                responses = client.simGetImages([
-                    airsim.ImageRequest(
+                responses = client.simGetImages(
+                    [airsim.ImageRequest(
                         self.airsim_camera, airsim.ImageType.Scene,
-                        pixels_as_float=False, compress=True)
-                ])
+                        pixels_as_float=False, compress=True)],
+                    vehicle_name=self.airsim_vehicle_name)
                 if not responses or responses[0] is None or responses[0].width == 0:
                     continue
                 arr = np.frombuffer(responses[0].image_data_uint8, dtype=np.uint8)
