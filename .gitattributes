@@ -1,0 +1,9 @@
+# Normalize all text files to LF in the repository, regardless of how the
+# working tree was edited (this repo is edited from Windows over \\wsl.localhost).
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.so binary
+*.bin binary
