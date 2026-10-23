@@ -22,7 +22,7 @@ graph TD
     E2 --> F[Convert to OpenCV format]
     F --> G[Calculate fetch FPS]
     G --> H[Push to frame_queue]
-    H --> P2[Throttle loop to video_target_fps]
+    H --> P2[Throttle loop to video.target_fps]
     P2 --> E
     I[Queue Full?] -->|Yes| J[Remove oldest frame]
     I -->|No| K[Add new frame]

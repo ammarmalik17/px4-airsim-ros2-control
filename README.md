@@ -159,7 +159,8 @@ documented with the reasoning behind each value in [px4_params.md](px4_params.md
 ## Tests
 
 ```bash
-colcon test --packages-select airsim_offboard --event-handlers console_direct+
+colcon test --packages-select airsim_offboard --python-testing pytest
+colcon test-result --verbose          # -> 3 tests, 0 errors, 0 failures
 ```
 
 Three unit tests cover the pure helpers in `airsim_offboard/velocity.py`
@@ -170,8 +171,10 @@ yaw wrapping). They import only the standard library, so they also run standalon
 cd src/airsim_offboard && python3 -m pytest test -q
 ```
 
-Note: `colcon test-result` reports zero tests because the colcon unittest runner
-does not emit JUnit XML — read the `console_direct+` output instead.
+Use `--python-testing pytest` to get JUnit results. colcon defaults to the
+`setuppy_test` runner (`python -m unittest`), which executes the same tests but
+emits no XML, so `colcon test-result` reports zero for it; add
+`--event-handlers console_direct+` if you want to read the raw unittest output.
 
 ## Troubleshooting
 
