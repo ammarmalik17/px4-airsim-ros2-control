@@ -128,11 +128,11 @@ Caveat: this removes the log noise and the `hrt` jumps, but does **not** align t
 
 ---
 
-## Node-side code changes (already applied in airsim_offboard_control.py)
+## Node-side code changes (already applied in src/airsim_offboard/airsim_offboard/offboard_control.py)
 
-| Location | Change | Purpose |
+| Symbol | Change | Purpose |
 |---|---|---|
-| Line 47 | Subscribe to `/fmu/out/vehicle_status_v1` (was `/fmu/out/vehicle_status`) | PX4 v1.16 renamed the topic due to `MESSAGE_VERSION=1` on VehicleStatus |
+| `PARAMETER_DEFAULTS['topic.vehicle_status']` | Subscribes to `/fmu/out/vehicle_status_v1` (was `/fmu/out/vehicle_status`) | PX4 v1.16 renamed the topic due to `MESSAGE_VERSION=1` on VehicleStatus |
 | `engage_offboard_mode()` | Poll `nav_state == 14` for 2 s instead of unconditional success print | Detect commander rejection with a real pass/fail |
 | `main()` | `while rclpy.ok() and self.running: rclpy.spin_once(...)` instead of `rclpy.spin(...)` | ESC key now actually exits (rclpy.spin blocks forever on flag changes) |
 

@@ -1,12 +1,13 @@
 # AirSim Camera Pipeline
 
-This document explains the camera pipeline implemented in the `airsim_offboard_control.py` script, which handles real-time video feed from AirSim simulation.
+This document explains the camera pipeline implemented in
+`src/airsim_offboard/airsim_offboard/offboard_control.py`, which handles real-time video feed from AirSim simulation.
 
 ## Overview
 
 The camera pipeline uses a producer-consumer model with multi-threading to fetch frames from AirSim and display them in real-time. It includes FPS tracking and frame queuing to maintain smooth video playback.
 
-The pipeline runs on a **dedicated AirSim client** (its own `MultirotorClient` RPC session) that is separate from the main control client, so video RPC calls never contend with the flight-control connection. Frames are requested **compressed** (JPEG/PNG), decoded with `cv2.imdecode`, and the fetch loop is **rate-limited** to `video_target_fps` to keep bandwidth, CPU, and GIL pressure low.
+The pipeline runs on a **dedicated AirSim client** (its own `MultirotorClient` RPC session) that is separate from the main control client, so video RPC calls never contend with the flight-control connection. Frames are requested **compressed** (JPEG/PNG), decoded with `cv2.imdecode`, and the fetch loop is **rate-limited** to `video.target_fps` to keep bandwidth, CPU, and GIL pressure low.
 
 ## Pipeline Architecture
 
@@ -44,7 +45,7 @@ graph TD
    - Decodes the compressed bytes into a BGR image via `cv2.imdecode`
    - Calculates and smooths fetch FPS
    - Pushes frames to a thread-safe queue
-   - Throttles itself to `video_target_fps` so the loop stops only as fast as needed
+   - Throttles itself to `video.target_fps` so the loop stops only as fast as needed
 
 2. **Consumer Thread (`video_display_loop`)**:
    - Retrieves frames from the queue
@@ -62,7 +63,8 @@ graph TD
 
 - **Isolated RPC Session**: Video uses its own AirSim client, avoiding thread-unsafe sharing of the main control client's msgpackrpc session
 - **Compressed Transfer**: Frames requested with `compress=True`, cutting per-frame payload from ~1.2 MB (raw 848x480 RGB) to tens of KB
-- **Rate Limiting**: Fetch loop paced to `video_target_fps` to bound bandwidth, CPU, and GIL contention
+- **Rate Limiting**: Fetch loop paced to `video.target_fps` to bound bandwidth, CPU, and GIL contention
+- **Configurable**: `airsim.camera`, `video.target_fps`, `video.queue_size` and `video.window_name` are ROS 2 parameters (see `config/params.yaml`), so the camera and pacing can be changed without editing the node
 - **Thread Safety**: Uses Python's `queue.Queue` for thread-safe frame passing
 - **Performance Monitoring**: Tracks both fetch and render FPS
 - **Memory Management**: Bounded queue prevents memory overflow
