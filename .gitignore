@@ -1,7 +1,15 @@
+# colcon / Python artifacts
 build/
 install/
 log/
-.gitignore
-.qoderignore
 venv/
 __pycache__/
+
+# Editor state
+.qoderignore
+
+# Third-party PX4 packages: cloned upstream, not part of this project.
+# px4_msgs    https://github.com/PX4/px4_msgs.git    @ 4fa362a1baac731be75ed7748698d8f626eaaf24
+# px4_ros_com https://github.com/PX4/px4_ros_com.git @ 86e9aeb20e55a4673fa8a9f1c29ea06a6c5ad1af
+src/px4_msgs/
+src/px4_ros_com/
